@@ -233,6 +233,40 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("✅ Готово! Новых или подешевевших билетов нет.")
 
 
+async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data     = load_data()
+    journeys = data.get("journeys", {})
+
+    if not journeys:
+        await update.message.reply_text(
+            "Данных пока нет. Нажми 🔍 Проверить сейчас.", reply_markup=KEYBOARD
+        )
+        return
+
+    # Build list of (price, departure_dt, from_name)
+    tickets = []
+    for key, val in journeys.items():
+        try:
+            from_name = key.split("|")[0]
+            departure = datetime.fromisoformat(val["departure"])
+            tickets.append((val["price"], departure, from_name))
+        except (KeyError, ValueError, IndexError):
+            continue
+
+    tickets.sort(key=lambda x: x[0])
+    top = tickets[:3]
+
+    lines = ["💰 Топ-3 самых дешёвых билета:\n"]
+    for i, (price, dep, from_name) in enumerate(top, 1):
+        lines.append(
+            f"{i}. {from_name} → Paris\n"
+            f"   📅 {dep.strftime('%d.%m.%Y')}  🕐 {dep.strftime('%H:%M')}\n"
+            f"   💶 {price:.0f}€"
+        )
+
+    await update.message.reply_text("\n".join(lines), reply_markup=KEYBOARD)
+
+
 async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data       = load_data()
     last_check = data.get("last_check")
@@ -300,6 +334,7 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("prices", cmd_prices))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler(timezone="Europe/Berlin")
