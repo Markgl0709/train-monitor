@@ -254,9 +254,9 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             continue
 
     tickets.sort(key=lambda x: x[0])
-    top = tickets[:3]
+    top = tickets[:10]
 
-    lines = ["💰 Топ-3 самых дешёвых билета:\n"]
+    lines = ["💰 Топ-10 самых дешёвых билетов:\n"]
     for i, (price, dep, from_name) in enumerate(top, 1):
         lines.append(
             f"{i}. {from_name} → Paris\n"
