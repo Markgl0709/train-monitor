@@ -1,4 +1,4 @@
 python-telegram-bot==21.6
-pyhafas==0.4.1
+pyhafas
 APScheduler==3.10.4
 python-dotenv==1.0.1
