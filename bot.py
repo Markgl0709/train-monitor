@@ -15,9 +15,8 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pyhafas import HafasClient
-from pyhafas.profile import DBProfile
 
 load_dotenv()
 
@@ -46,7 +45,7 @@ KEYBOARD = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
-hafas = HafasClient(DBProfile())
+DB_REST_API = "https://v6.db.transport.rest"
 
 # Users currently waiting to enter a max price
 _awaiting_price: set[int] = set()
@@ -73,46 +72,46 @@ def save_data(data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _fetch_day(from_id: str, to_id: str, date: datetime) -> list:
-    """Synchronous HAFAS call — run via run_in_executor."""
+    """Fetch journeys via public DB REST API — run via run_in_executor."""
     try:
-        from pyhafas.types.fptf import Station
-        origin      = Station(id=from_id, name="")
-        destination = Station(id=to_id,   name="")
-        return hafas.journeys(
-            origin=origin,
-            destination=destination,
-            date=date,
-            max_changes=2,
-            max_journeys=20,
+        resp = requests.get(
+            f"{DB_REST_API}/journeys",
+            params={
+                "from":      from_id,
+                "to":        to_id,
+                "departure": date.isoformat(),
+                "results":   10,
+                "stopovers": "false",
+                "remarks":   "false",
+            },
+            timeout=20,
         )
+        resp.raise_for_status()
+        return resp.json().get("journeys", [])
     except Exception as e:
-        logger.warning("HAFAS error (%s → %s, %s): %s", from_id, to_id, date.date(), e)
+        logger.warning("DB REST error (%s → %s, %s): %s", from_id, to_id, date.date(), e)
         return []
 
 
-def _parse_price(journey) -> Optional[float]:
+def _parse_price(journey: dict) -> Optional[float]:
     """Return price in EUR or None if unavailable."""
-    price = getattr(journey, "price", None)
-    if price is None:
+    price = journey.get("price")
+    if not price:
         return None
-    if hasattr(price, "amount"):
-        amount = float(price.amount)
-        # HAFAS sometimes returns cents (e.g. 4900 for 49 €)
-        return amount / 100 if amount > 500 else amount
-    if isinstance(price, (int, float)):
-        return float(price)
-    return None
+    amount = price.get("amount")
+    return float(amount) if amount is not None else None
 
 
 def _price_label(price: Optional[float]) -> str:
     return f"{price:.0f}€" if price is not None else "цена не указана"
 
 
-def _journey_key(from_name: str, journey) -> Optional[str]:
+def _journey_key(from_name: str, journey: dict) -> Optional[str]:
     try:
-        dep = journey.legs[0].departure
+        dep_str = journey["legs"][0]["departure"]
+        dep = datetime.fromisoformat(dep_str)
         return f"{from_name}|{dep.strftime('%Y%m%d%H%M')}"
-    except (IndexError, AttributeError):
+    except (KeyError, IndexError, ValueError):
         return None
 
 
@@ -163,8 +162,8 @@ async def check_prices(application: Optional[Application] = None) -> int:
                 continue
 
             try:
-                departure = journey.legs[0].departure
-            except (IndexError, AttributeError):
+                departure = datetime.fromisoformat(journey["legs"][0]["departure"])
+            except (KeyError, IndexError, ValueError):
                 continue
 
             price_eur = _parse_price(journey)
