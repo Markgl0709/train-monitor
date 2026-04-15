@@ -26,14 +26,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
+NAVITIA_TOKEN   = os.environ["NAVITIA_TOKEN"]
 DATA_FILE = Path("prices.json")
 CHECK_DAYS = 60
 
+NAVITIA_API = "https://api.navitia.io/v1"
+
+# from_id / to_id are filled at startup via _resolve_station()
 ROUTES = [
-    {"from_name": "Düsseldorf Hbf", "from_id": "8000085", "to_id": "8796066"},
-    {"from_name": "Köln Hbf",        "from_id": "8000207", "to_id": "8796066"},
+    {"from_name": "Düsseldorf Hbf", "to_name": "Paris-Nord", "from_id": None, "to_id": None},
+    {"from_name": "Köln Hbf",       "to_name": "Paris-Nord", "from_id": None, "to_id": None},
 ]
 
 KEYBOARD = ReplyKeyboardMarkup(
@@ -44,8 +48,6 @@ KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
     is_persistent=True,
 )
-
-DB_REST_API = "https://v6.db.transport.rest"
 
 # Users currently waiting to enter a max price
 _awaiting_price: set[int] = set()
@@ -68,38 +70,52 @@ def save_data(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HAFAS fetching (runs in a thread so it doesn't block the event loop)
+# Navitia helpers (run in a thread via run_in_executor)
 # ---------------------------------------------------------------------------
 
-def _fetch_day(from_id: str, to_id: str, date: datetime) -> list:
-    """Fetch journeys via public DB REST API — run via run_in_executor."""
+def _navitia_get(path: str, params: dict) -> dict:
+    resp = requests.get(
+        f"{NAVITIA_API}{path}",
+        params=params,
+        auth=(NAVITIA_TOKEN, ""),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _resolve_station(name: str) -> Optional[str]:
+    """Return Navitia stop_area ID for a station name, or None."""
     try:
-        resp = requests.get(
-            f"{DB_REST_API}/journeys",
-            params={
-                "from":      from_id,
-                "to":        to_id,
-                "departure": date.isoformat(),
-                "results":   10,
-                "stopovers": "false",
-                "remarks":   "false",
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return resp.json().get("journeys", [])
+        data = _navitia_get("/places", {"q": name, "type[]": "stop_area", "count": 1})
+        return data["places"][0]["id"]
     except Exception as e:
-        logger.warning("DB REST error (%s → %s, %s): %s", from_id, to_id, date.date(), e)
+        logger.error("Could not resolve station '%s': %s", name, e)
+        return None
+
+
+def _fetch_day(from_id: str, to_id: str, date: datetime) -> list:
+    """Fetch journeys via Navitia API."""
+    try:
+        data = _navitia_get("/journeys", {
+            "from":     from_id,
+            "to":       to_id,
+            "datetime": date.strftime("%Y%m%dT%H%M%S"),
+            "count":    10,
+        })
+        return data.get("journeys", [])
+    except Exception as e:
+        logger.warning("Navitia error (%s → %s, %s): %s", from_id, to_id, date.date(), e)
         return []
 
 
 def _parse_price(journey: dict) -> Optional[float]:
     """Return price in EUR or None if unavailable."""
-    price = journey.get("price")
-    if not price:
+    fare = journey.get("fare", {})
+    if not fare.get("found"):
         return None
-    amount = price.get("amount")
-    return float(amount) if amount is not None else None
+    value = fare.get("total", {}).get("value")
+    return float(value) if value else None
 
 
 def _price_label(price: Optional[float]) -> str:
@@ -108,10 +124,10 @@ def _price_label(price: Optional[float]) -> str:
 
 def _journey_key(from_name: str, journey: dict) -> Optional[str]:
     try:
-        dep_str = journey["legs"][0]["departure"]
-        dep = datetime.fromisoformat(dep_str)
+        dep_str = journey["departure_date_time"]        # "20260416T100000"
+        dep = datetime.strptime(dep_str, "%Y%m%dT%H%M%S")
         return f"{from_name}|{dep.strftime('%Y%m%d%H%M')}"
-    except (KeyError, IndexError, ValueError):
+    except (KeyError, ValueError):
         return None
 
 
@@ -162,8 +178,8 @@ async def check_prices(application: Optional[Application] = None) -> int:
                 continue
 
             try:
-                departure = datetime.fromisoformat(journey["legs"][0]["departure"])
-            except (KeyError, IndexError, ValueError):
+                departure = datetime.strptime(journey["departure_date_time"], "%Y%m%dT%H%M%S")
+            except (KeyError, ValueError):
                 continue
 
             price_eur = _parse_price(journey)
@@ -357,6 +373,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Resolve Navitia station IDs once at startup
+    for route in ROUTES:
+        if route["from_id"] is None:
+            route["from_id"] = _resolve_station(route["from_name"])
+        if route["to_id"] is None:
+            route["to_id"] = _resolve_station(route["to_name"])
+        logger.info("Route: %s → %s  |  %s → %s",
+                    route["from_name"], route["to_name"],
+                    route["from_id"], route["to_id"])
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
