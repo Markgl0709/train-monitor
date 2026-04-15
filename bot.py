@@ -40,7 +40,7 @@ ROUTES = [
 KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🔍 Проверить сейчас"), KeyboardButton("📋 Статус")],
-        [KeyboardButton("💶 Установить макс. цену")],
+        [KeyboardButton("💰 Топ-10 билетов"), KeyboardButton("💶 Установить макс. цену")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -306,6 +306,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await handle_check(update, context)
     elif text == "📋 Статус":
         await handle_status(update, context)
+    elif text == "💰 Топ-10 билетов":
+        await cmd_prices(update, context)
     elif text == "💶 Установить макс. цену":
         await handle_set_price(update, context)
     elif user_id in _awaiting_price:
