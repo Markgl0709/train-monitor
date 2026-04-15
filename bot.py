@@ -104,6 +104,10 @@ def _parse_price(journey) -> Optional[float]:
     return None
 
 
+def _price_label(price: Optional[float]) -> str:
+    return f"{price:.0f}€" if price is not None else "цена не указана"
+
+
 def _journey_key(from_name: str, journey) -> Optional[str]:
     try:
         dep = journey.legs[0].departure
@@ -144,12 +148,6 @@ async def check_prices(application: Optional[Application] = None) -> int:
             )
 
             for journey in journeys:
-                price_eur = _parse_price(journey)
-                if price_eur is None:
-                    continue
-                if max_price and price_eur > max_price:
-                    continue
-
                 key = _journey_key(from_name, journey)
                 if key is None:
                     continue
@@ -159,16 +157,32 @@ async def check_prices(application: Optional[Application] = None) -> int:
                 except (IndexError, AttributeError):
                     continue
 
-                updated[key] = {"price": price_eur, "departure": departure.isoformat()}
+                price_eur = _parse_price(journey)
+                if max_price and price_eur is not None and price_eur > max_price:
+                    continue
 
-                old_price = old.get(key, {}).get("price")
-                if old_price is None or price_eur < old_price - 0.01:
+                updated[key] = {
+                    "price":     price_eur,
+                    "departure": departure.isoformat(),
+                }
+
+                old_entry = old.get(key)
+                old_price = old_entry.get("price") if old_entry else None
+
+                is_new        = old_entry is None
+                price_dropped = (
+                    price_eur is not None
+                    and old_price is not None
+                    and price_eur < old_price - 0.01
+                )
+                if is_new or price_dropped:
                     alerts.append(
                         {
                             "from_name": from_name,
                             "departure": departure,
                             "price":     price_eur,
                             "old_price": old_price,
+                            "is_new":    is_new,
                         }
                     )
 
@@ -187,8 +201,8 @@ async def check_prices(application: Optional[Application] = None) -> int:
             price     = a["price"]
             old_price = a["old_price"]
 
-            if old_price is None:
-                badge = "🆕 Новый билет"
+            if a["is_new"]:
+                badge = "🆕 Новый рейс"
             else:
                 diff  = old_price - price
                 badge = f"📉 Подешевел на {diff:.0f}€"
@@ -197,9 +211,9 @@ async def check_prices(application: Optional[Application] = None) -> int:
                 f"{badge}\n"
                 f"🚆 {a['from_name']} → Paris\n"
                 f"📅 {dep.strftime('%d.%m.%Y')}  🕐 {dep.strftime('%H:%M')}\n"
-                f"💶 {price:.0f}€"
+                f"💶 {_price_label(price)}"
             )
-            if old_price is not None:
+            if not a["is_new"] and old_price is not None:
                 text += f"  (было {old_price:.0f}€)"
 
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
@@ -243,25 +257,28 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    # Build list of (price, departure_dt, from_name)
+    # Build list of (price_or_None, departure_dt, from_name)
     tickets = []
     for key, val in journeys.items():
         try:
             from_name = key.split("|")[0]
             departure = datetime.fromisoformat(val["departure"])
-            tickets.append((val["price"], departure, from_name))
+            tickets.append((val.get("price"), departure, from_name))
         except (KeyError, ValueError, IndexError):
             continue
 
-    tickets.sort(key=lambda x: x[0])
+    # Sort: priced tickets first (cheapest), then unpriced by date
+    tickets.sort(key=lambda x: (x[0] is None, x[0] or 0, x[1]))
     top = tickets[:10]
 
-    lines = ["💰 Топ-10 самых дешёвых билетов:\n"]
+    header = "💰 Топ-10 самых дешёвых билетов:\n" if any(p is not None for p, *_ in top) \
+             else "🚆 Ближайшие 10 рейсов (цены недоступны):\n"
+    lines  = [header]
     for i, (price, dep, from_name) in enumerate(top, 1):
         lines.append(
             f"{i}. {from_name} → Paris\n"
             f"   📅 {dep.strftime('%d.%m.%Y')}  🕐 {dep.strftime('%H:%M')}\n"
-            f"   💶 {price:.0f}€"
+            f"   💶 {_price_label(price)}"
         )
 
     await update.message.reply_text("\n".join(lines), reply_markup=KEYBOARD)
