@@ -120,73 +120,81 @@ def _journey_key(from_name: str, journey) -> Optional[str]:
 # Core check logic
 # ---------------------------------------------------------------------------
 
+CONCURRENCY = 10  # parallel HAFAS requests
+
+
 async def check_prices(application: Optional[Application] = None) -> int:
-    """Fetch prices for all routes × next CHECK_DAYS days.
+    """Fetch prices for all routes × next CHECK_DAYS days in parallel.
 
     Returns the number of notifications sent.
     """
     loop      = asyncio.get_event_loop()
     data      = load_data()
     old       = data.get("journeys", {})
-    updated   = {}
-    alerts    = []
     max_price = data.get("max_price")
     now       = datetime.now()
 
-    for route in ROUTES:
-        from_name = route["from_name"]
-        from_id   = route["from_id"]
-        to_id     = route["to_id"]
+    # Build all (route, date) tasks upfront
+    tasks = [
+        (route, now + timedelta(days=d))
+        for route in ROUTES
+        for d in range(CHECK_DAYS)
+    ]
 
-        for day_offset in range(CHECK_DAYS):
-            check_date = now + timedelta(days=day_offset)
-            # Replace hour so we get departures for the whole day
-            check_dt = check_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    semaphore = asyncio.Semaphore(CONCURRENCY)
 
-            journeys = await loop.run_in_executor(
-                None, _fetch_day, from_id, to_id, check_dt
+    async def fetch_one(route, date):
+        check_dt = date.replace(hour=0, minute=0, second=0, microsecond=0)
+        async with semaphore:
+            result = await loop.run_in_executor(
+                None, _fetch_day, route["from_id"], route["to_id"], check_dt
             )
+        return route["from_name"], result
 
-            for journey in journeys:
-                key = _journey_key(from_name, journey)
-                if key is None:
-                    continue
+    results = await asyncio.gather(*(fetch_one(r, d) for r, d in tasks))
 
-                try:
-                    departure = journey.legs[0].departure
-                except (IndexError, AttributeError):
-                    continue
+    updated = {}
+    alerts  = []
 
-                price_eur = _parse_price(journey)
-                if max_price and price_eur is not None and price_eur > max_price:
-                    continue
+    for from_name, journeys in results:
+        for journey in journeys:
+            key = _journey_key(from_name, journey)
+            if key is None:
+                continue
 
-                updated[key] = {
-                    "price":     price_eur,
-                    "departure": departure.isoformat(),
-                }
+            try:
+                departure = journey.legs[0].departure
+            except (IndexError, AttributeError):
+                continue
 
-                old_entry = old.get(key)
-                old_price = old_entry.get("price") if old_entry else None
+            price_eur = _parse_price(journey)
+            if max_price and price_eur is not None and price_eur > max_price:
+                continue
 
-                is_new        = old_entry is None
-                price_dropped = (
-                    price_eur is not None
-                    and old_price is not None
-                    and price_eur < old_price - 0.01
+            updated[key] = {
+                "price":     price_eur,
+                "departure": departure.isoformat(),
+            }
+
+            old_entry = old.get(key)
+            old_price = old_entry.get("price") if old_entry else None
+
+            is_new        = old_entry is None
+            price_dropped = (
+                price_eur is not None
+                and old_price is not None
+                and price_eur < old_price - 0.01
+            )
+            if is_new or price_dropped:
+                alerts.append(
+                    {
+                        "from_name": from_name,
+                        "departure": departure,
+                        "price":     price_eur,
+                        "old_price": old_price,
+                        "is_new":    is_new,
+                    }
                 )
-                if is_new or price_dropped:
-                    alerts.append(
-                        {
-                            "from_name": from_name,
-                            "departure": departure,
-                            "price":     price_eur,
-                            "old_price": old_price,
-                            "is_new":    is_new,
-                        }
-                    )
-
-            await asyncio.sleep(0.3)  # be gentle with the API
 
     data["journeys"]   = updated
     data["last_check"] = now.isoformat()
