@@ -156,16 +156,20 @@ async def _do_check_prices(application=None) -> int:
         for d in range(CHECK_DAYS)
     ]
 
-    async with httpx.AsyncClient() as client:
-        results = await asyncio.gather(*(
-            _fetch_day(
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+    sem = asyncio.Semaphore(5)  # max 5 parallel requests to avoid rate-limiting
+
+    async def fetch_with_sem(route, date):
+        async with sem:
+            return await _fetch_day(
                 client,
-                r["from_id"],
-                r["from_name"],
-                d.replace(hour=0, minute=0, second=0, microsecond=0),
+                route["from_id"],
+                route["from_name"],
+                date.replace(hour=0, minute=0, second=0, microsecond=0),
             )
-            for r, d in tasks
-        ))
+
+    async with httpx.AsyncClient(headers=headers) as client:
+        results = await asyncio.gather(*(fetch_with_sem(r, d) for r, d in tasks))
 
     updated = {}
     alerts  = []
