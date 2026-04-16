@@ -32,7 +32,7 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 DATA_FILE  = Path("prices.json")
 CHECK_DAYS = 60
-CONCURRENCY = 3   # concurrent Playwright pages
+CONCURRENCY = 1   # one page at a time to keep memory low
 
 ROUTES = [
     {"from_name": "Düsseldorf Hbf", "from_eva": "8000085", "to_eva": "8796066"},
@@ -62,7 +62,21 @@ async def _get_browser() -> Browser:
         _pw = await async_playwright().start()
         _browser = await _pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+                "--no-zygote",
+                "--disable-extensions",
+                "--disable-sync",
+                "--disable-background-networking",
+                "--disable-default-apps",
+                "--disable-translate",
+                "--mute-audio",
+                "--js-flags=--max-old-space-size=128",
+                "--renderer-process-limit=1",
+            ],
         )
         logger.info("Playwright browser started.")
     return _browser
@@ -250,6 +264,15 @@ async def check_prices(application=None) -> int:
         return route["from_name"], result
 
     results = await asyncio.gather(*(fetch_one(r, d) for r, d in tasks))
+
+    # Free Chromium memory after check cycle
+    global _browser, _pw
+    if _browser:
+        await _browser.close()
+        _browser = None
+    if _pw:
+        await _pw.stop()
+        _pw = None
 
     updated = {}
     alerts  = []
