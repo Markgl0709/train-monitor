@@ -109,9 +109,6 @@ def save_data(data: dict) -> None:
 # Scraping
 # ---------------------------------------------------------------------------
 
-def _date_str(date: datetime) -> str:
-    return date.strftime("%d.%m.%Y")
-
 
 def _extract_journeys_from_api(data: dict) -> list:
     """Try to extract normalised journey dicts from a captured API response."""
@@ -186,92 +183,62 @@ def _extract_journeys_from_api(data: dict) -> list:
 
 
 async def _fetch_day(context, from_eva: str, to_eva: str, from_name: str, date: datetime) -> list:
-    """Fill the bahn.de homepage search form and intercept the API response."""
+    """Call bahn.de's internal API via JS fetch from within the page (same-origin, cookies included)."""
     page = await context.new_page()
     captured: list[dict] = []
-
-    async def on_response(response):
-        try:
-            ct = response.headers.get("content-type", "")
-            if "json" not in ct:
-                return
-            data = await response.json()
-            url  = response.url
-            if isinstance(data, dict) and data:
-                keys = list(data.keys())[:8]
-                logger.info("JSON [%s] keys=%s", url.split("?")[0][-80:], keys)
-            journeys = _extract_journeys_from_api(data)
-            if journeys:
-                logger.info("Got %d journeys from %s %s", len(journeys), from_name, date.date())
-                captured.extend(journeys)
-        except Exception:
-            pass
-
-    page.on("response", on_response)
 
     try:
         await page.goto("https://www.bahn.de", timeout=20_000, wait_until="load")
 
-        # --- Fill "Von" (departure) ---
-        von = page.locator(
-            "input[aria-label='Von'], input[placeholder*='Von'], "
-            "input[data-testid='startInput'], #fromInput, input[name='from']"
-        ).first
-        await von.click(timeout=5000)
-        await von.fill(from_name)
-        await asyncio.sleep(1)
-        # Pick first autocomplete suggestion
-        suggestion = page.locator(
-            "[class*='autocomplete'] li, [role='option'], [class*='suggestion']"
-        ).first
-        try:
-            await suggestion.click(timeout=3000)
-        except Exception:
-            await page.keyboard.press("ArrowDown")
-            await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
+        date_str = date.strftime("%Y-%m-%dT06:00")
 
-        # --- Fill "Nach" (destination) ---
-        nach = page.locator(
-            "input[aria-label='Nach'], input[placeholder*='Nach'], "
-            "input[data-testid='destinationInput'], #toInput, input[name='to']"
-        ).first
-        await nach.click(timeout=5000)
-        await nach.fill("Paris")
-        await asyncio.sleep(1)
-        suggestion2 = page.locator(
-            "[class*='autocomplete'] li, [role='option'], [class*='suggestion']"
-        ).first
-        try:
-            await suggestion2.click(timeout=3000)
-        except Exception:
-            await page.keyboard.press("ArrowDown")
-            await page.keyboard.press("Enter")
-        await asyncio.sleep(0.5)
+        # Call the internal bahn.de search API from within page JS context.
+        # Same-origin fetch: cookies are included automatically, no CORS issues.
+        result = await page.evaluate(f"""
+            async () => {{
+                const params = new URLSearchParams({{
+                    sts: 'true',
+                    so: {json.dumps(from_name)},
+                    zo: 'Paris Nord',
+                    kl: '2',
+                    r: '13:16',
+                    hd: {json.dumps(date_str)},
+                    'hz': '[]',
+                    ar: 'false',
+                    s: 'true',
+                    d: 'false',
+                    soei: {json.dumps(from_eva)},
+                    zoei: {json.dumps(to_eva)},
+                    start: 'true'
+                }});
+                const url = '/web/api/angebote/fahrplan?' + params.toString();
+                const r = await fetch(url, {{
+                    credentials: 'include',
+                    headers: {{
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    }}
+                }});
+                const text = await r.text();
+                return {{status: r.status, body: text.slice(0, 4000)}};
+            }}
+        """)
 
-        # --- Set date ---
-        date_input = page.locator(
-            "input[aria-label*='Datum'], input[aria-label*='datum'], "
-            "input[type='date'], input[data-testid*='date'], input[placeholder*='TT.MM.JJJJ']"
-        ).first
-        try:
-            await date_input.click(timeout=3000)
-            await date_input.triple_click()
-            await date_input.type(_date_str(date))
-            await page.keyboard.press("Tab")
-        except Exception:
-            pass
+        status = result.get("status")
+        body   = result.get("body", "")
+        logger.info("API %s %s — HTTP %s — body[:200]=%s", from_name, date.date(), status, body[:200])
 
-        # --- Click search ---
-        search_btn = page.locator(
-            "button[type='submit'], button[aria-label*='Suchen'], "
-            "button:has-text('Suchen'), [data-testid*='search-button']"
-        ).first
-        await search_btn.click(timeout=5000)
-
-        # Wait for results to load via JS
-        await asyncio.sleep(10)
-        logger.info("Result title [%s %s]: %s", from_name, date.date(), await page.title())
+        if status == 200:
+            try:
+                data = json.loads(body)
+                journeys = _extract_journeys_from_api(data)
+                if journeys:
+                    logger.info("Got %d journeys for %s %s", len(journeys), from_name, date.date())
+                    captured.extend(journeys)
+                else:
+                    logger.info("Parsed OK but no journeys extracted. Keys: %s", list(data.keys())[:8])
+            except Exception as ex:
+                logger.warning("JSON parse error (%s %s): %s | body=%s", from_name, date.date(), ex, body[:200])
 
     except Exception as e:
         logger.warning("Playwright error (%s %s): %s", from_name, date.date(), e)
