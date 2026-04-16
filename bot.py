@@ -66,7 +66,6 @@ async def _get_browser() -> Browser:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
-                "--single-process",
                 "--no-zygote",
                 "--disable-extensions",
                 "--disable-sync",
@@ -74,8 +73,8 @@ async def _get_browser() -> Browser:
                 "--disable-default-apps",
                 "--disable-translate",
                 "--mute-audio",
+                "--disable-blink-features=AutomationControlled",
                 "--js-flags=--max-old-space-size=128",
-                "--renderer-process-limit=1",
             ],
         )
         logger.info("Playwright browser started.")
@@ -229,7 +228,9 @@ async def _fetch_day(from_eva: str, to_eva: str, from_name: str, date: datetime)
 
     url = _search_url(from_name, from_eva, to_eva, date)
     try:
-        await page.goto(url, timeout=30_000, wait_until="networkidle")
+        await page.goto(url, timeout=25_000, wait_until="load")
+        # Give JS 4 seconds to fire the internal API calls we intercept
+        await asyncio.sleep(4)
     except Exception as e:
         logger.warning("Playwright nav error (%s %s): %s", from_name, date.date(), e)
 
@@ -353,13 +354,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 _awaiting_price: set[int] = set()
 
 
+async def _run_check_and_notify(application: Application) -> None:
+    try:
+        count = await check_prices(application)
+        msg = f"✅ Готово! Отправлено уведомлений: {count}." if count else "✅ Готово! Новых или подешевевших билетов нет."
+    except Exception as e:
+        msg = f"❌ Ошибка при проверке: {e}"
+    await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+
+
 async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🔄 Запускаю проверку, подождите…", reply_markup=KEYBOARD)
-    count = await check_prices(context.application)
-    if count:
-        await update.message.reply_text(f"✅ Готово! Отправлено уведомлений: {count}.")
-    else:
-        await update.message.reply_text("✅ Готово! Новых или подешевевших билетов нет.")
+    await update.message.reply_text(
+        "🔄 Запускаю проверку, это займёт ~10–15 минут. Результат пришлю когда закончу.",
+        reply_markup=KEYBOARD,
+    )
+    asyncio.create_task(_run_check_and_notify(context.application))
 
 
 async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
