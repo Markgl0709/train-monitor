@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import asyncio
+import re
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -15,12 +17,8 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pyhafas import HafasClient
-from pyhafas.profile import DBProfile
-
-hafas = HafasClient(DBProfile())
+from playwright.async_api import async_playwright, Browser, Playwright
 
 load_dotenv()
 
@@ -34,10 +32,11 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 DATA_FILE  = Path("prices.json")
 CHECK_DAYS = 60
+CONCURRENCY = 3   # concurrent Playwright pages
 
 ROUTES = [
-    {"from_name": "Düsseldorf Hbf", "from_id": "8000085", "to_id": "8796066"},
-    {"from_name": "Köln Hbf",       "from_id": "8000207", "to_id": "8796066"},
+    {"from_name": "Düsseldorf Hbf", "from_eva": "8000085", "to_eva": "8796066"},
+    {"from_name": "Köln Hbf",       "from_eva": "8000207", "to_eva": "8796066"},
 ]
 
 KEYBOARD = ReplyKeyboardMarkup(
@@ -49,8 +48,24 @@ KEYBOARD = ReplyKeyboardMarkup(
     is_persistent=True,
 )
 
-# Users currently waiting to enter a max price
-_awaiting_price: set[int] = set()
+# ---------------------------------------------------------------------------
+# Playwright browser singleton
+# ---------------------------------------------------------------------------
+
+_pw: Optional[Playwright] = None
+_browser: Optional[Browser] = None
+
+
+async def _get_browser() -> Browser:
+    global _pw, _browser
+    if _browser is None or not _browser.is_connected():
+        _pw = await async_playwright().start()
+        _browser = await _pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"],
+        )
+        logger.info("Playwright browser started.")
+    return _browser
 
 
 # ---------------------------------------------------------------------------
@@ -70,71 +85,154 @@ def save_data(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# pyhafas fetching (runs in a thread so it doesn't block the event loop)
+# Scraping
 # ---------------------------------------------------------------------------
 
-def _fetch_day(from_id: str, to_id: str, date: datetime) -> list:
-    """Synchronous HAFAS call — run via run_in_executor."""
-    try:
-        from pyhafas.types.fptf import Station
-        origin      = Station(id=from_id, name="")
-        destination = Station(id=to_id,   name="")
-        return hafas.journeys(
-            origin=origin,
-            destination=destination,
-            date=date,
-            max_changes=2,
-            max_journeys=20,
+def _search_url(from_name: str, from_eva: str, to_eva: str, date: datetime) -> str:
+    date_str = date.strftime("%Y-%m-%dT06:00")
+    to_name  = "Paris+Nord"
+    so_id    = urllib.parse.quote(f"A=1@O={from_name}@U=80@L={from_eva}@B=1@")
+    zo_id    = urllib.parse.quote(f"A=1@O=Paris Nord@U=80@L={to_eva}@B=1@")
+    return (
+        "https://www.bahn.de/buchung/fahrplan/suche"
+        f"#sts=true&so={urllib.parse.quote(from_name)}&zo={to_name}"
+        f"&kl=2&r=13:16&hd={date_str}&hz=%5B%5D&ar=false&s=true&d=false&pk="
+        f"&soid={so_id}&soei={from_eva}"
+        f"&zoid={zo_id}&zoei={to_eva}&start=true"
+    )
+
+
+def _extract_journeys_from_api(data: dict) -> list:
+    """Try to extract normalised journey dicts from a captured API response."""
+    raw = (
+        data.get("verbindungen")
+        or data.get("journeys")
+        or data.get("connections")
+        or []
+    )
+    journeys = []
+    for item in raw:
+        # --- departure ---
+        dep_raw = (
+            item.get("abfahrt")
+            or item.get("abfahrtszeit")
+            or item.get("departure")
+            or item.get("departure_date_time")
         )
-    except Exception as e:
-        logger.warning("HAFAS error (%s → %s, %s): %s", from_id, to_id, date.date(), e)
-        return []
+        if not dep_raw:
+            # dive into first section
+            sections = item.get("verbindungsAbschnitte") or item.get("sections") or item.get("legs") or []
+            if sections:
+                sec = sections[0]
+                dep_raw = sec.get("abfahrt") or sec.get("departure")
+        if not dep_raw:
+            continue
+
+        try:
+            if "T" in str(dep_raw) and len(str(dep_raw)) > 12:
+                dep_dt = datetime.fromisoformat(str(dep_raw)[:19])
+            else:
+                dep_dt = datetime.strptime(str(dep_raw)[:16], "%Y%m%dT%H%M")
+        except ValueError:
+            continue
+
+        # --- price ---
+        price = None
+        for field in [
+            "preisGuenstigster", "preis", "price", "fare",
+            "angebotPreis", "bestPreis",
+        ]:
+            obj = item.get(field)
+            if not obj:
+                continue
+            # price object with amount/betrag
+            amount = obj.get("betrag") or obj.get("amount") or obj.get("value")
+            if amount is not None:
+                try:
+                    price = float(amount)
+                except (TypeError, ValueError):
+                    pass
+                break
+            # price as a number directly
+            if isinstance(obj, (int, float)):
+                price = float(obj)
+                break
+
+        # Check angebote list
+        if price is None:
+            for angebot in (item.get("angebote") or []):
+                p = angebot.get("preis") or angebot.get("price") or {}
+                amount = p.get("betrag") or p.get("amount")
+                if amount is not None:
+                    try:
+                        price = float(amount)
+                        break
+                    except (TypeError, ValueError):
+                        pass
+
+        journeys.append({"departure": dep_dt.isoformat(), "price": price})
+    return journeys
 
 
-def _parse_price(journey) -> Optional[float]:
-    """Return price in EUR or None if unavailable."""
-    price = getattr(journey, "price", None)
-    if price is None:
-        return None
-    if hasattr(price, "amount"):
-        amount = float(price.amount)
-        return amount / 100 if amount > 500 else amount
-    if isinstance(price, (int, float)):
-        return float(price)
-    return None
+async def _fetch_day(from_eva: str, to_eva: str, from_name: str, date: datetime) -> list:
+    """Open bahn.de search in Playwright, intercept the API response."""
+    browser = await _get_browser()
+    context = await browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        locale="de-DE",
+    )
+    page = await context.new_page()
 
+    captured: list[dict] = []
 
-def _price_label(price: Optional[float]) -> str:
-    return f"{price:.0f}€" if price is not None else "цена не указана"
+    async def on_response(response):
+        try:
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            url = response.url
+            if not any(k in url for k in ["angebote", "verbindung", "reiseloesung", "fahrplan"]):
+                return
+            data = await response.json()
+            journeys = _extract_journeys_from_api(data)
+            if journeys:
+                logger.info(
+                    "Intercepted %d journeys from %s", len(journeys), url.split("?")[0][-60:]
+                )
+                captured.extend(journeys)
+            elif isinstance(data, dict):
+                # Log unknown structure once so we can adapt parsing
+                keys = list(data.keys())[:8]
+                logger.debug("Unknown API response keys: %s  url=%s", keys, url[-80:])
+        except Exception:
+            pass
 
+    page.on("response", on_response)
 
-def _journey_key(from_name: str, journey) -> Optional[str]:
+    url = _search_url(from_name, from_eva, to_eva, date)
     try:
-        dep = journey.legs[0].departure
-        return f"{from_name}|{dep.strftime('%Y%m%d%H%M')}"
-    except (IndexError, AttributeError):
-        return None
+        await page.goto(url, timeout=30_000, wait_until="networkidle")
+    except Exception as e:
+        logger.warning("Playwright nav error (%s %s): %s", from_name, date.date(), e)
+
+    await context.close()
+    return captured
 
 
 # ---------------------------------------------------------------------------
 # Core check logic
 # ---------------------------------------------------------------------------
 
-CONCURRENCY = 10  # parallel HAFAS requests
-
-
-async def check_prices(application: Optional[Application] = None) -> int:
-    """Fetch prices for all routes × next CHECK_DAYS days in parallel.
-
-    Returns the number of notifications sent.
-    """
-    loop      = asyncio.get_event_loop()
+async def check_prices(application=None) -> int:
     data      = load_data()
     old       = data.get("journeys", {})
     max_price = data.get("max_price")
     now       = datetime.now()
 
-    # Build all (route, date) tasks upfront
     tasks = [
         (route, now + timedelta(days=d))
         for route in ROUTES
@@ -146,8 +244,8 @@ async def check_prices(application: Optional[Application] = None) -> int:
     async def fetch_one(route, date):
         check_dt = date.replace(hour=0, minute=0, second=0, microsecond=0)
         async with semaphore:
-            result = await loop.run_in_executor(
-                None, _fetch_day, route["from_id"], route["to_id"], check_dt
+            result = await _fetch_day(
+                route["from_eva"], route["to_eva"], route["from_name"], check_dt
             )
         return route["from_name"], result
 
@@ -157,76 +255,61 @@ async def check_prices(application: Optional[Application] = None) -> int:
     alerts  = []
 
     for from_name, journeys in results:
-        for journey in journeys:
-            key = _journey_key(from_name, journey)
-            if key is None:
-                continue
-
+        for j in journeys:
             try:
-                departure = journey.legs[0].departure
-            except (IndexError, AttributeError):
+                departure = datetime.fromisoformat(j["departure"])
+            except (KeyError, ValueError):
                 continue
 
-            price_eur = _parse_price(journey)
+            key = f"{from_name}|{departure.strftime('%Y%m%d%H%M')}"
+
+            price_eur = j.get("price")
             if max_price and price_eur is not None and price_eur > max_price:
                 continue
 
-            updated[key] = {
-                "price":     price_eur,
-                "departure": departure.isoformat(),
-            }
+            updated[key] = {"price": price_eur, "departure": departure.isoformat()}
 
             old_entry = old.get(key)
             old_price = old_entry.get("price") if old_entry else None
-
-            is_new        = old_entry is None
+            is_new    = old_entry is None
             price_dropped = (
                 price_eur is not None
                 and old_price is not None
                 and price_eur < old_price - 0.01
             )
             if is_new or price_dropped:
-                alerts.append(
-                    {
-                        "from_name": from_name,
-                        "departure": departure,
-                        "price":     price_eur,
-                        "old_price": old_price,
-                        "is_new":    is_new,
-                    }
-                )
+                alerts.append({
+                    "from_name": from_name,
+                    "departure": departure,
+                    "price":     price_eur,
+                    "old_price": old_price,
+                    "is_new":    is_new,
+                })
 
     data["journeys"]   = updated
     data["last_check"] = now.isoformat()
     save_data(data)
 
     if alerts and application:
-        bot = application.bot
-        # Sort by date
         alerts.sort(key=lambda x: x["departure"])
+        bot = application.bot
         for a in alerts:
             dep       = a["departure"]
             price     = a["price"]
             old_price = a["old_price"]
-
-            if a["is_new"]:
-                badge = "🆕 Новый рейс"
-            else:
-                diff  = old_price - price
-                badge = f"📉 Подешевел на {diff:.0f}€"
-
+            badge     = "🆕 Новый рейс" if a["is_new"] else f"📉 Подешевел на {old_price - price:.0f}€"
+            price_str = f"{price:.0f}€" if price is not None else "цена не указана"
             text = (
                 f"{badge}\n"
                 f"🚆 {a['from_name']} → Paris\n"
                 f"📅 {dep.strftime('%d.%m.%Y')}  🕐 {dep.strftime('%H:%M')}\n"
-                f"💶 {_price_label(price)}"
+                f"💶 {price_str}"
             )
             if not a["is_new"] and old_price is not None:
                 text += f"  (было {old_price:.0f}€)"
-
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
-    logger.info("Check complete — %d alerts, %d journeys tracked", len(alerts), len(updated))
+    logger.info("Check done — %d alerts, %d journeys tracked", len(alerts), len(updated))
     return len(alerts)
 
 
@@ -237,13 +320,14 @@ async def check_prices(application: Optional[Application] = None) -> int:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Привет! Я слежу за ценами на поезда из Германии в Париж.\n\n"
-        "Маршруты:\n"
-        "• Düsseldorf Hbf → Paris\n"
-        "• Köln Hbf → Paris\n\n"
+        "Маршруты:\n• Düsseldorf Hbf → Paris\n• Köln Hbf → Paris\n\n"
         "Проверяю цены каждый час на ближайшие 60 дней.\n"
         "Уведомления приходят только при появлении новых или подешевевших билетов.",
         reply_markup=KEYBOARD,
     )
+
+
+_awaiting_price: set[int] = set()
 
 
 async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -258,14 +342,10 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data     = load_data()
     journeys = data.get("journeys", {})
-
     if not journeys:
-        await update.message.reply_text(
-            "Данных пока нет. Нажми 🔍 Проверить сейчас.", reply_markup=KEYBOARD
-        )
+        await update.message.reply_text("Данных пока нет. Нажми 🔍 Проверить сейчас.", reply_markup=KEYBOARD)
         return
 
-    # Build list of (price_or_None, departure_dt, from_name)
     tickets = []
     for key, val in journeys.items():
         try:
@@ -275,35 +355,29 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except (KeyError, ValueError, IndexError):
             continue
 
-    # Sort: priced tickets first (cheapest), then unpriced by date
     tickets.sort(key=lambda x: (x[0] is None, x[0] or 0, x[1]))
     top = tickets[:10]
 
-    header = "💰 Топ-10 самых дешёвых билетов:\n" if any(p is not None for p, *_ in top) \
-             else "🚆 Ближайшие 10 рейсов (цены недоступны):\n"
+    has_prices = any(p is not None for p, *_ in top)
+    header = "💰 Топ-10 самых дешёвых билетов:\n" if has_prices else "🚆 Ближайшие 10 рейсов (цены недоступны):\n"
     lines  = [header]
     for i, (price, dep, from_name) in enumerate(top, 1):
+        price_str = f"{price:.0f}€" if price is not None else "цена не указана"
         lines.append(
             f"{i}. {from_name} → Paris\n"
             f"   📅 {dep.strftime('%d.%m.%Y')}  🕐 {dep.strftime('%H:%M')}\n"
-            f"   💶 {_price_label(price)}"
+            f"   💶 {price_str}"
         )
-
     await update.message.reply_text("\n".join(lines), reply_markup=KEYBOARD)
 
 
 async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    data       = load_data()
+    data      = load_data()
     last_check = data.get("last_check")
     max_price  = data.get("max_price")
     total      = len(data.get("journeys", {}))
-
-    last_str  = (
-        datetime.fromisoformat(last_check).strftime("%d.%m.%Y %H:%M")
-        if last_check else "ещё не было"
-    )
-    price_str = f"{max_price:.0f}€" if max_price else "не установлен (все цены)"
-
+    last_str   = datetime.fromisoformat(last_check).strftime("%d.%m.%Y %H:%M") if last_check else "ещё не было"
+    price_str  = f"{max_price:.0f}€" if max_price else "не установлен (все цены)"
     await update.message.reply_text(
         f"📊 Статус бота\n\n"
         f"🕐 Последняя проверка: {last_str}\n"
@@ -317,8 +391,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def handle_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _awaiting_price.add(update.effective_user.id)
     await update.message.reply_text(
-        "Введите максимальную цену в EUR (например: 120).\n"
-        "Отправьте 0, чтобы убрать ограничение.",
+        "Введите максимальную цену в EUR (например: 120).\nОтправьте 0, чтобы убрать ограничение.",
         reply_markup=KEYBOARD,
     )
 
@@ -341,16 +414,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except ValueError:
             await update.message.reply_text("❌ Введите число, например: 120", reply_markup=KEYBOARD)
             return
-
         _awaiting_price.discard(user_id)
-        data               = load_data()
-        data["max_price"]  = value if value > 0 else None
+        data              = load_data()
+        data["max_price"] = value if value > 0 else None
         save_data(data)
-
-        if value > 0:
-            await update.message.reply_text(f"✅ Макс. цена установлена: {value:.0f}€", reply_markup=KEYBOARD)
-        else:
-            await update.message.reply_text("✅ Ограничение цены снято.", reply_markup=KEYBOARD)
+        msg = f"✅ Макс. цена установлена: {value:.0f}€" if value > 0 else "✅ Ограничение цены снято."
+        await update.message.reply_text(msg, reply_markup=KEYBOARD)
 
 
 # ---------------------------------------------------------------------------
@@ -370,11 +439,11 @@ def main() -> None:
         trigger="interval",
         hours=1,
         kwargs={"application": app},
-        next_run_time=datetime.now(),  # run immediately on startup
+        next_run_time=datetime.now(),
         id="hourly_check",
     )
     scheduler.start()
-    logger.info("Scheduler started — first check running now, then every hour.")
+    logger.info("Scheduler started.")
 
     app.run_polling(drop_pending_updates=True)
 

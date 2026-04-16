@@ -1,5 +1,4 @@
 python-telegram-bot==21.6
-pyhafas
-requests==2.32.3
+playwright==1.44.0
 APScheduler==3.10.4
 python-dotenv==1.0.1
