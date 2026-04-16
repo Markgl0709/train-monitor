@@ -197,17 +197,8 @@ def _extract_journeys_from_api(data: dict) -> list:
     return journeys
 
 
-async def _fetch_day(from_eva: str, to_eva: str, from_name: str, date: datetime) -> list:
-    """Open bahn.de search in Playwright, intercept the API response."""
-    browser = await _get_browser()
-    context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        locale="de-DE",
-    )
+async def _fetch_day(context, from_eva: str, to_eva: str, from_name: str, date: datetime) -> list:
+    """Open a new page in an existing browser context, intercept the API response."""
     page = await context.new_page()
 
     captured: list[dict] = []
@@ -235,31 +226,13 @@ async def _fetch_day(from_eva: str, to_eva: str, from_name: str, date: datetime)
     url = _search_url(from_name, from_eva, to_eva, date)
     try:
         await page.goto(url, timeout=25_000, wait_until="load")
-
-        # Accept cookie consent if present
-        for selector in [
-            "button#onetrust-accept-btn-handler",
-            "button[data-testid='cookie-accept']",
-            "button:has-text('Alle akzeptieren')",
-            "button:has-text('Akzeptieren')",
-            "button:has-text('Accept all')",
-        ]:
-            try:
-                btn = page.locator(selector).first
-                if await btn.is_visible(timeout=2000):
-                    await btn.click()
-                    logger.info("Accepted cookie consent (%s)", selector)
-                    break
-            except Exception:
-                pass
-
-        # Wait for bahn.de to load results via JS
-        await asyncio.sleep(6)
-        logger.info("Page title after load: %s", await page.title())
+        await asyncio.sleep(8)
+        logger.info("Search page title [%s %s]: %s", from_name, date.date(), await page.title())
     except Exception as e:
         logger.warning("Playwright nav error (%s %s): %s", from_name, date.date(), e)
+    finally:
+        await page.close()
 
-    await context.close()
     return captured
 
 
@@ -293,17 +266,56 @@ async def _do_check_prices(application=None) -> int:
         for d in range(CHECK_DAYS)
     ]
 
+    # Create a single browser context for the entire check cycle
+    browser = await _get_browser()
+    context = await browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        locale="de-DE",
+    )
+
+    # Load homepage once to establish session cookies
+    try:
+        hp = await context.new_page()
+        await hp.goto("https://www.bahn.de", timeout=20_000, wait_until="load")
+        logger.info("Homepage title: %s", await hp.title())
+        # Accept cookie consent once
+        for selector in [
+            "button#onetrust-accept-btn-handler",
+            "button[data-testid='cookie-accept']",
+            "button:has-text('Alle akzeptieren')",
+            "button:has-text('Akzeptieren')",
+            "button:has-text('Accept all')",
+        ]:
+            try:
+                btn = hp.locator(selector).first
+                if await btn.is_visible(timeout=3000):
+                    await btn.click()
+                    logger.info("Accepted cookie consent (%s)", selector)
+                    break
+            except Exception:
+                pass
+        await asyncio.sleep(2)
+        await hp.close()
+    except Exception as e:
+        logger.warning("Homepage load error: %s", e)
+
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
     async def fetch_one(route, date):
         check_dt = date.replace(hour=0, minute=0, second=0, microsecond=0)
         async with semaphore:
             result = await _fetch_day(
-                route["from_eva"], route["to_eva"], route["from_name"], check_dt
+                context, route["from_eva"], route["to_eva"], route["from_name"], check_dt
             )
         return route["from_name"], result
 
     results = await asyncio.gather(*(fetch_one(r, d) for r, d in tasks))
+
+    await context.close()
 
     # Free Chromium memory after check cycle
     global _browser, _pw
