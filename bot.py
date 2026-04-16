@@ -81,6 +81,16 @@ async def _get_browser() -> Browser:
     return _browser
 
 
+# Only one price check may run at a time
+_check_lock: Optional[asyncio.Lock] = None
+
+def _get_check_lock() -> asyncio.Lock:
+    global _check_lock
+    if _check_lock is None:
+        _check_lock = asyncio.Lock()
+    return _check_lock
+
+
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
@@ -243,6 +253,15 @@ async def _fetch_day(from_eva: str, to_eva: str, from_name: str, date: datetime)
 # ---------------------------------------------------------------------------
 
 async def check_prices(application=None) -> int:
+    lock = _get_check_lock()
+    if lock.locked():
+        logger.info("Check already running, skipping.")
+        return 0
+    async with lock:
+        return await _do_check_prices(application)
+
+
+async def _do_check_prices(application=None) -> int:
     data      = load_data()
     old       = data.get("journeys", {})
     max_price = data.get("max_price")
