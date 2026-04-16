@@ -217,20 +217,16 @@ async def _fetch_day(from_eva: str, to_eva: str, from_name: str, date: datetime)
             ct = response.headers.get("content-type", "")
             if "json" not in ct:
                 return
-            url = response.url
-            if not any(k in url for k in ["angebote", "verbindung", "reiseloesung", "fahrplan"]):
-                return
             data = await response.json()
+            url  = response.url
+            # Log ALL json responses so we can see what bahn.de returns
+            if isinstance(data, dict) and data:
+                keys = list(data.keys())[:6]
+                logger.info("JSON response [%s] keys=%s", url.split("?")[0][-70:], keys)
             journeys = _extract_journeys_from_api(data)
             if journeys:
-                logger.info(
-                    "Intercepted %d journeys from %s", len(journeys), url.split("?")[0][-60:]
-                )
+                logger.info("Intercepted %d journeys from %s", len(journeys), url[-60:])
                 captured.extend(journeys)
-            elif isinstance(data, dict):
-                # Log unknown structure once so we can adapt parsing
-                keys = list(data.keys())[:8]
-                logger.debug("Unknown API response keys: %s  url=%s", keys, url[-80:])
         except Exception:
             pass
 
@@ -239,8 +235,27 @@ async def _fetch_day(from_eva: str, to_eva: str, from_name: str, date: datetime)
     url = _search_url(from_name, from_eva, to_eva, date)
     try:
         await page.goto(url, timeout=25_000, wait_until="load")
-        # Give JS 4 seconds to fire the internal API calls we intercept
-        await asyncio.sleep(4)
+
+        # Accept cookie consent if present
+        for selector in [
+            "button#onetrust-accept-btn-handler",
+            "button[data-testid='cookie-accept']",
+            "button:has-text('Alle akzeptieren')",
+            "button:has-text('Akzeptieren')",
+            "button:has-text('Accept all')",
+        ]:
+            try:
+                btn = page.locator(selector).first
+                if await btn.is_visible(timeout=2000):
+                    await btn.click()
+                    logger.info("Accepted cookie consent (%s)", selector)
+                    break
+            except Exception:
+                pass
+
+        # Wait for bahn.de to load results via JS
+        await asyncio.sleep(6)
+        logger.info("Page title after load: %s", await page.title())
     except Exception as e:
         logger.warning("Playwright nav error (%s %s): %s", from_name, date.date(), e)
 
@@ -256,6 +271,11 @@ async def check_prices(application=None) -> int:
     lock = _get_check_lock()
     if lock.locked():
         logger.info("Check already running, skipping.")
+        if application:
+            await application.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text="⏳ Проверка уже выполняется, подождите окончания.",
+            )
         return 0
     async with lock:
         return await _do_check_prices(application)
