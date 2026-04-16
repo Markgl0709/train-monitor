@@ -2,8 +2,6 @@ import os
 import json
 import logging
 import asyncio
-import re
-import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -111,18 +109,8 @@ def save_data(data: dict) -> None:
 # Scraping
 # ---------------------------------------------------------------------------
 
-def _search_url(from_name: str, from_eva: str, to_eva: str, date: datetime) -> str:
-    date_str = date.strftime("%Y-%m-%dT06:00")
-    to_name  = "Paris+Nord"
-    so_id    = urllib.parse.quote(f"A=1@O={from_name}@U=80@L={from_eva}@B=1@")
-    zo_id    = urllib.parse.quote(f"A=1@O=Paris Nord@U=80@L={to_eva}@B=1@")
-    return (
-        "https://www.bahn.de/buchung/fahrplan/suche"
-        f"#sts=true&so={urllib.parse.quote(from_name)}&zo={to_name}"
-        f"&kl=2&r=13:16&hd={date_str}&hz=%5B%5D&ar=false&s=true&d=false&pk="
-        f"&soid={so_id}&soei={from_eva}"
-        f"&zoid={zo_id}&zoei={to_eva}&start=true"
-    )
+def _date_str(date: datetime) -> str:
+    return date.strftime("%d.%m.%Y")
 
 
 def _extract_journeys_from_api(data: dict) -> list:
@@ -198,9 +186,8 @@ def _extract_journeys_from_api(data: dict) -> list:
 
 
 async def _fetch_day(context, from_eva: str, to_eva: str, from_name: str, date: datetime) -> list:
-    """Open a new page in an existing browser context, intercept the API response."""
+    """Fill the bahn.de homepage search form and intercept the API response."""
     page = await context.new_page()
-
     captured: list[dict] = []
 
     async def on_response(response):
@@ -210,26 +197,84 @@ async def _fetch_day(context, from_eva: str, to_eva: str, from_name: str, date: 
                 return
             data = await response.json()
             url  = response.url
-            # Log ALL json responses so we can see what bahn.de returns
             if isinstance(data, dict) and data:
-                keys = list(data.keys())[:6]
-                logger.info("JSON response [%s] keys=%s", url.split("?")[0][-70:], keys)
+                keys = list(data.keys())[:8]
+                logger.info("JSON [%s] keys=%s", url.split("?")[0][-80:], keys)
             journeys = _extract_journeys_from_api(data)
             if journeys:
-                logger.info("Intercepted %d journeys from %s", len(journeys), url[-60:])
+                logger.info("Got %d journeys from %s %s", len(journeys), from_name, date.date())
                 captured.extend(journeys)
         except Exception:
             pass
 
     page.on("response", on_response)
 
-    url = _search_url(from_name, from_eva, to_eva, date)
     try:
-        await page.goto(url, timeout=25_000, wait_until="load")
-        await asyncio.sleep(8)
-        logger.info("Search page title [%s %s]: %s", from_name, date.date(), await page.title())
+        await page.goto("https://www.bahn.de", timeout=20_000, wait_until="load")
+
+        # --- Fill "Von" (departure) ---
+        von = page.locator(
+            "input[aria-label='Von'], input[placeholder*='Von'], "
+            "input[data-testid='startInput'], #fromInput, input[name='from']"
+        ).first
+        await von.click(timeout=5000)
+        await von.fill(from_name)
+        await asyncio.sleep(1)
+        # Pick first autocomplete suggestion
+        suggestion = page.locator(
+            "[class*='autocomplete'] li, [role='option'], [class*='suggestion']"
+        ).first
+        try:
+            await suggestion.click(timeout=3000)
+        except Exception:
+            await page.keyboard.press("ArrowDown")
+            await page.keyboard.press("Enter")
+        await asyncio.sleep(0.5)
+
+        # --- Fill "Nach" (destination) ---
+        nach = page.locator(
+            "input[aria-label='Nach'], input[placeholder*='Nach'], "
+            "input[data-testid='destinationInput'], #toInput, input[name='to']"
+        ).first
+        await nach.click(timeout=5000)
+        await nach.fill("Paris")
+        await asyncio.sleep(1)
+        suggestion2 = page.locator(
+            "[class*='autocomplete'] li, [role='option'], [class*='suggestion']"
+        ).first
+        try:
+            await suggestion2.click(timeout=3000)
+        except Exception:
+            await page.keyboard.press("ArrowDown")
+            await page.keyboard.press("Enter")
+        await asyncio.sleep(0.5)
+
+        # --- Set date ---
+        date_input = page.locator(
+            "input[aria-label*='Datum'], input[aria-label*='datum'], "
+            "input[type='date'], input[data-testid*='date'], input[placeholder*='TT.MM.JJJJ']"
+        ).first
+        try:
+            await date_input.click(timeout=3000)
+            await date_input.triple_click()
+            await date_input.type(_date_str(date))
+            await page.keyboard.press("Tab")
+        except Exception:
+            pass
+
+        # --- Click search ---
+        search_btn = page.locator(
+            "button[type='submit'], button[aria-label*='Suchen'], "
+            "button:has-text('Suchen'), [data-testid*='search-button']"
+        ).first
+        await search_btn.click(timeout=5000)
+
+        # Wait for results to load via JS
+        await asyncio.sleep(10)
+        logger.info("Result title [%s %s]: %s", from_name, date.date(), await page.title())
+
     except Exception as e:
-        logger.warning("Playwright nav error (%s %s): %s", from_name, date.date(), e)
+        logger.warning("Playwright error (%s %s): %s", from_name, date.date(), e)
     finally:
         await page.close()
 
@@ -276,32 +321,6 @@ async def _do_check_prices(application=None) -> int:
         ),
         locale="de-DE",
     )
-
-    # Load homepage once to establish session cookies
-    try:
-        hp = await context.new_page()
-        await hp.goto("https://www.bahn.de", timeout=20_000, wait_until="load")
-        logger.info("Homepage title: %s", await hp.title())
-        # Accept cookie consent once
-        for selector in [
-            "button#onetrust-accept-btn-handler",
-            "button[data-testid='cookie-accept']",
-            "button:has-text('Alle akzeptieren')",
-            "button:has-text('Akzeptieren')",
-            "button:has-text('Accept all')",
-        ]:
-            try:
-                btn = hp.locator(selector).first
-                if await btn.is_visible(timeout=3000):
-                    await btn.click()
-                    logger.info("Accepted cookie consent (%s)", selector)
-                    break
-            except Exception:
-                pass
-        await asyncio.sleep(2)
-        await hp.close()
-    except Exception as e:
-        logger.warning("Homepage load error: %s", e)
 
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
