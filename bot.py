@@ -2,9 +2,9 @@ import os
 import json
 import logging
 import asyncio
+import httpx
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -16,7 +16,6 @@ from telegram.ext import (
     ContextTypes,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from playwright.async_api import async_playwright, Browser, Playwright
 
 load_dotenv()
 
@@ -30,64 +29,32 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 DATA_FILE  = Path("prices.json")
 CHECK_DAYS = 60
-CONCURRENCY = 1   # one page at a time to keep memory low
 
 ROUTES = [
-    {"from_name": "Düsseldorf Hbf", "from_eva": "8000085", "to_eva": "8796066"},
-    {"from_name": "Köln Hbf",       "from_eva": "8000207", "to_eva": "8796066"},
+    {"from_name": "Düsseldorf Hbf", "from_code": "DUS"},
+    {"from_name": "Köln Hbf",       "from_code": "KLN"},
 ]
+TO_CODE = "PAR"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    "Referer": "https://www.eurostar.com/",
+}
 
 KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🔍 Проверить сейчас"), KeyboardButton("📋 Статус")],
-        [KeyboardButton("💰 Топ-10 билетов"), KeyboardButton("💶 Установить макс. цену")],
+        [KeyboardButton("💰 Топ-10 билетов"),   KeyboardButton("💶 Установить макс. цену")],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
-
-# ---------------------------------------------------------------------------
-# Playwright browser singleton
-# ---------------------------------------------------------------------------
-
-_pw: Optional[Playwright] = None
-_browser: Optional[Browser] = None
-
-
-async def _get_browser() -> Browser:
-    global _pw, _browser
-    if _browser is None or not _browser.is_connected():
-        _pw = await async_playwright().start()
-        _browser = await _pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-zygote",
-                "--disable-extensions",
-                "--disable-sync",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-translate",
-                "--mute-audio",
-                "--disable-blink-features=AutomationControlled",
-                "--js-flags=--max-old-space-size=128",
-            ],
-        )
-        logger.info("Playwright browser started.")
-    return _browser
-
-
-# Only one price check may run at a time
-_check_lock: Optional[asyncio.Lock] = None
-
-def _get_check_lock() -> asyncio.Lock:
-    global _check_lock
-    if _check_lock is None:
-        _check_lock = asyncio.Lock()
-    return _check_lock
-
 
 # ---------------------------------------------------------------------------
 # Data helpers
@@ -106,151 +73,111 @@ def save_data(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scraping
+# Eurostar scraping via httpx
 # ---------------------------------------------------------------------------
 
+def _extract_journeys(data, from_name: str) -> list:
+    """Parse Eurostar API JSON response into normalised journey dicts."""
+    journeys = []
 
-def _extract_journeys_from_api(data: dict) -> list:
-    """Try to extract normalised journey dicts from a captured API response."""
+    # Try different top-level keys Eurostar might use
     raw = (
-        data.get("verbindungen")
+        data.get("outboundJourneys")
         or data.get("journeys")
-        or data.get("connections")
+        or data.get("trips")
+        or data.get("trains")
         or []
     )
-    journeys = []
+    if isinstance(data, list):
+        raw = data
+
     for item in raw:
-        # --- departure ---
+        # Departure time
         dep_raw = (
-            item.get("abfahrt")
-            or item.get("abfahrtszeit")
+            item.get("departureDateTime")
             or item.get("departure")
-            or item.get("departure_date_time")
+            or item.get("departureDatetime")
+            or item.get("departureTime")
         )
         if not dep_raw:
-            # dive into first section
-            sections = item.get("verbindungsAbschnitte") or item.get("sections") or item.get("legs") or []
-            if sections:
-                sec = sections[0]
-                dep_raw = sec.get("abfahrt") or sec.get("departure")
-        if not dep_raw:
             continue
-
         try:
-            if "T" in str(dep_raw) and len(str(dep_raw)) > 12:
-                dep_dt = datetime.fromisoformat(str(dep_raw)[:19])
-            else:
-                dep_dt = datetime.strptime(str(dep_raw)[:16], "%Y%m%dT%H%M")
+            dep_dt = datetime.fromisoformat(str(dep_raw)[:19])
         except ValueError:
             continue
 
-        # --- price ---
+        # Price — try multiple locations
         price = None
-        for field in [
-            "preisGuenstigster", "preis", "price", "fare",
-            "angebotPreis", "bestPreis",
-        ]:
+        for field in ["lowestPrice", "price", "minPrice", "cheapestPrice", "fare"]:
             obj = item.get(field)
-            if not obj:
+            if obj is None:
                 continue
-            # price object with amount/betrag
-            amount = obj.get("betrag") or obj.get("amount") or obj.get("value")
-            if amount is not None:
-                try:
-                    price = float(amount)
-                except (TypeError, ValueError):
-                    pass
-                break
-            # price as a number directly
             if isinstance(obj, (int, float)):
                 price = float(obj)
                 break
-
-        # Check angebote list
-        if price is None:
-            for angebot in (item.get("angebote") or []):
-                p = angebot.get("preis") or angebot.get("price") or {}
-                amount = p.get("betrag") or p.get("amount")
+            if isinstance(obj, dict):
+                amount = obj.get("amount") or obj.get("value") or obj.get("cents")
                 if amount is not None:
                     try:
-                        price = float(amount)
+                        price = float(amount) / (100 if obj.get("currency") else 1)
                         break
                     except (TypeError, ValueError):
                         pass
 
         journeys.append({"departure": dep_dt.isoformat(), "price": price})
+
     return journeys
 
 
-async def _fetch_day(context, from_eva: str, to_eva: str, from_name: str, date: datetime) -> list:
-    """Call bahn.de's internal API via JS fetch from within the page (same-origin, cookies included)."""
-    page = await context.new_page()
-    captured: list[dict] = []
-
+async def _fetch_day(
+    client: httpx.AsyncClient,
+    from_code: str,
+    from_name: str,
+    date: datetime,
+) -> list:
+    date_str = date.strftime("%Y-%m-%d")
     try:
-        await page.goto("https://www.bahn.de", timeout=20_000, wait_until="load")
-
-        date_str = date.strftime("%Y-%m-%dT06:00")
-
-        # Call the internal bahn.de search API from within page JS context.
-        # Same-origin fetch: cookies are included automatically, no CORS issues.
-        result = await page.evaluate(f"""
-            async () => {{
-                const params = new URLSearchParams({{
-                    sts: 'true',
-                    so: {json.dumps(from_name)},
-                    zo: 'Paris Nord',
-                    kl: '2',
-                    r: '13:16',
-                    hd: {json.dumps(date_str)},
-                    'hz': '[]',
-                    ar: 'false',
-                    s: 'true',
-                    d: 'false',
-                    soei: {json.dumps(from_eva)},
-                    zoei: {json.dumps(to_eva)},
-                    start: 'true'
-                }});
-                const url = '/web/api/angebote/fahrplan?' + params.toString();
-                const r = await fetch(url, {{
-                    credentials: 'include',
-                    headers: {{
-                        'Accept': 'application/json',
-                        'X-Requested-With': 'XMLHttpRequest'
-                    }}
-                }});
-                const text = await r.text();
-                return {{status: r.status, body: text.slice(0, 4000)}};
-            }}
-        """)
-
-        status = result.get("status")
-        body   = result.get("body", "")
-        logger.info("API %s %s — HTTP %s — body[:200]=%s", from_name, date.date(), status, body[:200])
-
-        if status == 200:
-            try:
-                data = json.loads(body)
-                journeys = _extract_journeys_from_api(data)
-                if journeys:
-                    logger.info("Got %d journeys for %s %s", len(journeys), from_name, date.date())
-                    captured.extend(journeys)
-                else:
-                    logger.info("Parsed OK but no journeys extracted. Keys: %s", list(data.keys())[:8])
-            except Exception as ex:
-                logger.warning("JSON parse error (%s %s): %s | body=%s", from_name, date.date(), ex, body[:200])
-
+        resp = await client.get(
+            "https://www.eurostar.com/uk-en/train-search",
+            params={
+                "origin":         from_code,
+                "destination":    TO_CODE,
+                "outbound-date":  date_str,
+                "adult":          "1",
+            },
+            timeout=30,
+        )
+        ct = resp.headers.get("content-type", "")
+        logger.info(
+            "Eurostar %s %s → %s | CT=%s | body[:300]=%s",
+            from_name, date_str, resp.status_code, ct, resp.text[:300],
+        )
+        if resp.status_code == 200 and "json" in ct:
+            data = resp.json()
+            journeys = _extract_journeys(data, from_name)
+            if journeys:
+                logger.info("Got %d journeys for %s %s", len(journeys), from_name, date_str)
+            else:
+                logger.info("Parsed JSON OK but no journeys. Top-level keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+            return journeys
     except Exception as e:
-        logger.warning("Playwright error (%s %s): %s", from_name, date.date(), e)
-    finally:
-        await page.close()
-
-    return captured
+        logger.warning("Fetch error %s %s: %s", from_name, date_str, e)
+    return []
 
 
 # ---------------------------------------------------------------------------
-# Core check logic
+# Check logic
 # ---------------------------------------------------------------------------
+
+_check_lock: asyncio.Lock | None = None
+
+
+def _get_check_lock() -> asyncio.Lock:
+    global _check_lock
+    if _check_lock is None:
+        _check_lock = asyncio.Lock()
+    return _check_lock
+
 
 async def check_prices(application=None) -> int:
     lock = _get_check_lock()
@@ -278,53 +205,31 @@ async def _do_check_prices(application=None) -> int:
         for d in range(CHECK_DAYS)
     ]
 
-    # Create a single browser context for the entire check cycle
-    browser = await _get_browser()
-    context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        locale="de-DE",
-    )
-
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-
-    async def fetch_one(route, date):
-        check_dt = date.replace(hour=0, minute=0, second=0, microsecond=0)
-        async with semaphore:
-            result = await _fetch_day(
-                context, route["from_eva"], route["to_eva"], route["from_name"], check_dt
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
+        results = await asyncio.gather(*(
+            _fetch_day(
+                client,
+                r["from_code"],
+                r["from_name"],
+                d.replace(hour=0, minute=0, second=0, microsecond=0),
             )
-        return route["from_name"], result
-
-    results = await asyncio.gather(*(fetch_one(r, d) for r, d in tasks))
-
-    await context.close()
-
-    # Free Chromium memory after check cycle
-    global _browser, _pw
-    if _browser:
-        await _browser.close()
-        _browser = None
-    if _pw:
-        await _pw.stop()
-        _pw = None
+            for r, d in tasks
+        ))
 
     updated = {}
     alerts  = []
 
-    for from_name, journeys in results:
+    for (route, _), journeys in zip(tasks, results):
+        from_name = route["from_name"]
         for j in journeys:
             try:
                 departure = datetime.fromisoformat(j["departure"])
             except (KeyError, ValueError):
                 continue
 
-            key = f"{from_name}|{departure.strftime('%Y%m%d%H%M')}"
-
+            key       = f"{from_name}|{departure.strftime('%Y%m%d%H%M')}"
             price_eur = j.get("price")
+
             if max_price and price_eur is not None and price_eur > max_price:
                 continue
 
@@ -353,7 +258,6 @@ async def _do_check_prices(application=None) -> int:
 
     if alerts and application:
         alerts.sort(key=lambda x: x["departure"])
-        bot = application.bot
         for a in alerts:
             dep       = a["departure"]
             price     = a["price"]
@@ -368,7 +272,7 @@ async def _do_check_prices(application=None) -> int:
             )
             if not a["is_new"] and old_price is not None:
                 text += f"  (было {old_price:.0f}€)"
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+            await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
     logger.info("Check done — %d alerts, %d journeys tracked", len(alerts), len(updated))
     return len(alerts)
@@ -394,7 +298,11 @@ _awaiting_price: set[int] = set()
 async def _run_check_and_notify(application: Application) -> None:
     try:
         count = await check_prices(application)
-        msg = f"✅ Готово! Отправлено уведомлений: {count}." if count else "✅ Готово! Новых или подешевевших билетов нет."
+        msg = (
+            f"✅ Готово! Отправлено уведомлений: {count}."
+            if count
+            else "✅ Готово! Новых или подешевевших билетов нет."
+        )
     except Exception as e:
         msg = f"❌ Ошибка при проверке: {e}"
     await application.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
@@ -402,7 +310,7 @@ async def _run_check_and_notify(application: Application) -> None:
 
 async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🔄 Запускаю проверку, это займёт ~10–15 минут. Результат пришлю когда закончу.",
+        "🔄 Запускаю проверку, пришлю результат когда закончу.",
         reply_markup=KEYBOARD,
     )
     asyncio.create_task(_run_check_and_notify(context.application))
@@ -412,7 +320,9 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     data     = load_data()
     journeys = data.get("journeys", {})
     if not journeys:
-        await update.message.reply_text("Данных пока нет. Нажми 🔍 Проверить сейчас.", reply_markup=KEYBOARD)
+        await update.message.reply_text(
+            "Данных пока нет. Нажми 🔍 Проверить сейчас.", reply_markup=KEYBOARD
+        )
         return
 
     tickets = []
@@ -428,7 +338,7 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     top = tickets[:10]
 
     has_prices = any(p is not None for p, *_ in top)
-    header = "💰 Топ-10 самых дешёвых билетов:\n" if has_prices else "🚆 Ближайшие 10 рейсов (цены недоступны):\n"
+    header = "💰 Топ-10 самых дешёвых билетов:\n" if has_prices else "🚆 Ближайшие 10 рейсов:\n"
     lines  = [header]
     for i, (price, dep, from_name) in enumerate(top, 1):
         price_str = f"{price:.0f}€" if price is not None else "цена не указана"
@@ -441,12 +351,15 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    data      = load_data()
+    data       = load_data()
     last_check = data.get("last_check")
     max_price  = data.get("max_price")
     total      = len(data.get("journeys", {}))
-    last_str   = datetime.fromisoformat(last_check).strftime("%d.%m.%Y %H:%M") if last_check else "ещё не было"
-    price_str  = f"{max_price:.0f}€" if max_price else "не установлен (все цены)"
+    last_str   = (
+        datetime.fromisoformat(last_check).strftime("%d.%m.%Y %H:%M")
+        if last_check else "ещё не было"
+    )
+    price_str = f"{max_price:.0f}€" if max_price else "не установлен (все цены)"
     await update.message.reply_text(
         f"📊 Статус бота\n\n"
         f"🕐 Последняя проверка: {last_str}\n"
@@ -487,7 +400,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         data              = load_data()
         data["max_price"] = value if value > 0 else None
         save_data(data)
-        msg = f"✅ Макс. цена установлена: {value:.0f}€" if value > 0 else "✅ Ограничение цены снято."
+        msg = f"✅ Макс. цена: {value:.0f}€" if value > 0 else "✅ Ограничение цены снято."
         await update.message.reply_text(msg, reply_markup=KEYBOARD)
 
 
@@ -513,7 +426,6 @@ def main() -> None:
     )
     scheduler.start()
     logger.info("Scheduler started.")
-
     app.run_polling(drop_pending_updates=True)
 
 
