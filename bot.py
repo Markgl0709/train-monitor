@@ -30,22 +30,14 @@ TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 DATA_FILE  = Path("prices.json")
 CHECK_DAYS = 60
 
-ROUTES = [
-    {"from_name": "Düsseldorf Hbf", "from_code": "DUS"},
-    {"from_name": "Köln Hbf",       "from_code": "KLN"},
-]
-TO_CODE = "PAR"
+# v6.db.transport.rest — open community HAFAS wrapper, no API key required
+API_BASE = "https://v6.db.transport.rest"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-    "Referer": "https://www.eurostar.com/",
-}
+ROUTES = [
+    {"from_name": "Düsseldorf Hbf", "from_id": "8000085"},
+    {"from_name": "Köln Hbf",       "from_id": "8000207"},
+]
+PARIS_ID = "8700014"   # Paris Nord in DB's station database
 
 KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -73,96 +65,55 @@ def save_data(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Eurostar scraping via httpx
+# API fetching
 # ---------------------------------------------------------------------------
-
-def _extract_journeys(data, from_name: str) -> list:
-    """Parse Eurostar API JSON response into normalised journey dicts."""
-    journeys = []
-
-    # Try different top-level keys Eurostar might use
-    raw = (
-        data.get("outboundJourneys")
-        or data.get("journeys")
-        or data.get("trips")
-        or data.get("trains")
-        or []
-    )
-    if isinstance(data, list):
-        raw = data
-
-    for item in raw:
-        # Departure time
-        dep_raw = (
-            item.get("departureDateTime")
-            or item.get("departure")
-            or item.get("departureDatetime")
-            or item.get("departureTime")
-        )
-        if not dep_raw:
-            continue
-        try:
-            dep_dt = datetime.fromisoformat(str(dep_raw)[:19])
-        except ValueError:
-            continue
-
-        # Price — try multiple locations
-        price = None
-        for field in ["lowestPrice", "price", "minPrice", "cheapestPrice", "fare"]:
-            obj = item.get(field)
-            if obj is None:
-                continue
-            if isinstance(obj, (int, float)):
-                price = float(obj)
-                break
-            if isinstance(obj, dict):
-                amount = obj.get("amount") or obj.get("value") or obj.get("cents")
-                if amount is not None:
-                    try:
-                        price = float(amount) / (100 if obj.get("currency") else 1)
-                        break
-                    except (TypeError, ValueError):
-                        pass
-
-        journeys.append({"departure": dep_dt.isoformat(), "price": price})
-
-    return journeys
-
 
 async def _fetch_day(
     client: httpx.AsyncClient,
-    from_code: str,
+    from_id: str,
     from_name: str,
     date: datetime,
 ) -> list:
-    date_str = date.strftime("%Y-%m-%d")
+    """Fetch journeys for one route/date from v6.db.transport.rest."""
+    departure = date.strftime("%Y-%m-%dT06:00:00")
     try:
         resp = await client.get(
-            "https://www.eurostar.com/uk-en/train-search",
+            f"{API_BASE}/journeys",
             params={
-                "origin":         from_code,
-                "destination":    TO_CODE,
-                "outbound-date":  date_str,
-                "adult":          "1",
+                "from":      from_id,
+                "to":        PARIS_ID,
+                "departure": departure,
+                "results":   10,
+                "language":  "de",
             },
-            timeout=30,
+            timeout=20,
         )
-        ct = resp.headers.get("content-type", "")
-        logger.info(
-            "Eurostar %s %s → %s | CT=%s | body[:300]=%s",
-            from_name, date_str, resp.status_code, ct, resp.text[:300],
-        )
-        if resp.status_code == 200 and "json" in ct:
-            data = resp.json()
-            journeys = _extract_journeys(data, from_name)
-            if journeys:
-                logger.info("Got %d journeys for %s %s", len(journeys), from_name, date_str)
-            else:
-                logger.info("Parsed JSON OK but no journeys. Top-level keys: %s", list(data.keys()) if isinstance(data, dict) else type(data))
-            return journeys
+        resp.raise_for_status()
+        data = resp.json()
+        journeys = data.get("journeys", [])
+        result = []
+        for j in journeys:
+            legs = j.get("legs", [])
+            if not legs:
+                continue
+            dep_raw = legs[0].get("departure") or legs[0].get("plannedDeparture")
+            if not dep_raw:
+                continue
+            try:
+                dep_dt = datetime.fromisoformat(dep_raw)
+            except ValueError:
+                continue
+
+            price_obj = j.get("price")
+            price = float(price_obj["amount"]) if price_obj and price_obj.get("amount") is not None else None
+            result.append({"departure": dep_dt.isoformat(), "price": price})
+
+        logger.info("%s %s → %d journeys", from_name, date.date(), len(result))
+        return result
+
     except Exception as e:
-        logger.warning("Fetch error %s %s: %s", from_name, date_str, e)
-    return []
+        logger.warning("API error %s %s: %s", from_name, date.date(), e)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -205,11 +156,11 @@ async def _do_check_prices(application=None) -> int:
         for d in range(CHECK_DAYS)
     ]
 
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True) as client:
+    async with httpx.AsyncClient() as client:
         results = await asyncio.gather(*(
             _fetch_day(
                 client,
-                r["from_code"],
+                r["from_id"],
                 r["from_name"],
                 d.replace(hour=0, minute=0, second=0, microsecond=0),
             )
