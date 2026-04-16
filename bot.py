@@ -190,6 +190,10 @@ async def _do_check_prices(application=None) -> int:
 
             updated[key] = {"price": price_eur, "departure": departure.isoformat()}
 
+            # Skip already-departed trains
+            if departure < now:
+                continue
+
             old_entry = old.get(key)
             old_price = old_entry.get("price") if old_entry else None
             is_new    = old_entry is None
@@ -198,7 +202,9 @@ async def _do_check_prices(application=None) -> int:
                 and old_price is not None
                 and price_eur < old_price - 0.01
             )
-            if is_new or price_dropped:
+            # Only alert for new journeys that have a known price,
+            # or for any journey whose price dropped
+            if price_dropped or (is_new and price_eur is not None):
                 alerts.append({
                     "from_name": from_name,
                     "departure": departure,
@@ -212,18 +218,18 @@ async def _do_check_prices(application=None) -> int:
     save_data(data)
 
     if alerts and application:
-        alerts.sort(key=lambda x: x["departure"])
-        for a in alerts:
+        # Sort by price asc, cap at 30 per run to avoid flooding
+        alerts.sort(key=lambda x: (x["price"] or 9999, x["departure"]))
+        for a in alerts[:30]:
             dep       = a["departure"]
             price     = a["price"]
             old_price = a["old_price"]
             badge     = "🆕 Новый рейс" if a["is_new"] else f"📉 Подешевел на {old_price - price:.0f}€"
-            price_str = f"{price:.0f}€" if price is not None else "цена не указана"
             text = (
                 f"{badge}\n"
                 f"🚆 {a['from_name']} → Paris\n"
                 f"📅 {dep.strftime('%d.%m.%Y')}  🕐 {dep.strftime('%H:%M')}\n"
-                f"💶 {price_str}"
+                f"💶 {price:.0f}€"
             )
             if not a["is_new"] and old_price is not None:
                 text += f"  (было {old_price:.0f}€)"
