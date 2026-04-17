@@ -3,6 +3,7 @@ import json
 import logging
 import asyncio
 import httpx
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,14 +31,23 @@ TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 DATA_FILE  = Path("prices.json")
 CHECK_DAYS = 60
 
-# v6.db.transport.rest — open community HAFAS wrapper, no API key required
-API_BASE = "https://v6.db.transport.rest"
-
+# Eurostar (formerly Thalys) station codes
 ROUTES = [
-    {"from_name": "Düsseldorf Hbf", "from_id": "8000085"},
-    {"from_name": "Köln Hbf",       "from_id": "8000207"},
+    {"from_name": "Düsseldorf Hbf", "eurostar_code": "DUE"},
+    {"from_name": "Köln Hbf",       "eurostar_code": "KKO"},
 ]
-PARIS_ID = "8700014"   # Paris Nord in DB's station database
+PARIS_CODE = "PNO"   # Paris Gare du Nord, Eurostar/Thalys code
+
+EUROSTAR_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Referer": "https://www.eurostar.com/",
+}
 
 KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -65,55 +75,93 @@ def save_data(data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# API fetching
+# Eurostar scraping
 # ---------------------------------------------------------------------------
+
+def _parse_next_data(html: str) -> list:
+    """Extract journey+price data from Next.js __NEXT_DATA__ embedded in HTML."""
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+    if not m:
+        return []
+    try:
+        nd = json.loads(m.group(1))
+    except Exception:
+        return []
+
+    # Drill into Next.js props to find journey data
+    # Typical path: pageProps -> journeys / outboundJourneys / trips
+    props = nd.get("props", {}).get("pageProps", {})
+    raw = (
+        props.get("outboundJourneys")
+        or props.get("journeys")
+        or props.get("trips")
+        or props.get("results", {}).get("outbound")
+        or []
+    )
+    journeys = []
+    for item in raw:
+        dep_raw = (
+            item.get("departureDateTime")
+            or item.get("departure")
+            or item.get("departureDatetime")
+        )
+        if not dep_raw:
+            continue
+        try:
+            dep_dt = datetime.fromisoformat(str(dep_raw)[:19])
+        except ValueError:
+            continue
+
+        price = None
+        for field in ["lowestPrice", "price", "minPrice", "cheapestFare", "fare"]:
+            obj = item.get(field)
+            if obj is None:
+                continue
+            if isinstance(obj, (int, float)):
+                price = float(obj)
+                break
+            if isinstance(obj, dict):
+                amt = obj.get("amount") or obj.get("value") or obj.get("cents")
+                if amt is not None:
+                    # cents vs euros: if > 1000 likely cents
+                    price = float(amt) / 100 if float(amt) > 500 else float(amt)
+                    break
+
+        journeys.append({"departure": dep_dt.isoformat(), "price": price})
+    return journeys
+
 
 async def _fetch_day(
     client: httpx.AsyncClient,
-    from_id: str,
+    eurostar_code: str,
     from_name: str,
     date: datetime,
 ) -> list:
-    """Fetch journeys for one route/date from v6.db.transport.rest."""
-    departure = date.strftime("%Y-%m-%dT06:00:00")
+    date_str = date.strftime("%Y-%m-%d")
+    url = (
+        f"https://www.eurostar.com/uk-en/train-search"
+        f"?origin={eurostar_code}&destination={PARIS_CODE}"
+        f"&outbound-date={date_str}&adult=1"
+    )
     try:
-        resp = await client.get(
-            f"{API_BASE}/journeys",
-            params={
-                "from":      from_id,
-                "to":        PARIS_ID,
-                "departure": departure,
-                "results":   10,
-                "language":  "de",
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        journeys = data.get("journeys", [])
-        result = []
-        for j in journeys:
-            legs = j.get("legs", [])
-            if not legs:
-                continue
-            dep_raw = legs[0].get("departure") or legs[0].get("plannedDeparture")
-            if not dep_raw:
-                continue
-            try:
-                dep_dt = datetime.fromisoformat(dep_raw)
-            except ValueError:
-                continue
+        resp = await client.get(url, timeout=30)
+        ct = resp.headers.get("content-type", "")
+        logger.info("Eurostar %s %s → HTTP %s | CT=%s | body[:150]=%s",
+                    from_name, date_str, resp.status_code, ct, resp.text[:150])
 
-            price_obj = j.get("price")
-            price = float(price_obj["amount"]) if price_obj and price_obj.get("amount") is not None else None
-            result.append({"departure": dep_dt.isoformat(), "price": price})
-
-        logger.info("%s %s → %d journeys", from_name, date.date(), len(result))
-        return result
-
+        if resp.status_code == 200:
+            if "json" in ct:
+                data = resp.json()
+                journeys = _parse_next_data(json.dumps(data))  # unlikely but handle it
+                logger.info("JSON response, keys=%s", list(data.keys()) if isinstance(data, dict) else "list")
+                return journeys
+            else:
+                journeys = _parse_next_data(resp.text)
+                logger.info("HTML parsed → %d journeys for %s %s", len(journeys), from_name, date_str)
+                return journeys
     except Exception as e:
-        logger.warning("API error %s %s: %s", from_name, date.date(), e)
-        return []
+        logger.warning("Fetch error %s %s: %s", from_name, date_str, e)
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -156,19 +204,18 @@ async def _do_check_prices(application=None) -> int:
         for d in range(CHECK_DAYS)
     ]
 
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
-    sem = asyncio.Semaphore(5)  # max 5 parallel requests to avoid rate-limiting
+    sem = asyncio.Semaphore(3)
 
     async def fetch_with_sem(route, date):
         async with sem:
             return await _fetch_day(
                 client,
-                route["from_id"],
+                route["eurostar_code"],
                 route["from_name"],
                 date.replace(hour=0, minute=0, second=0, microsecond=0),
             )
 
-    async with httpx.AsyncClient(headers=headers) as client:
+    async with httpx.AsyncClient(headers=EUROSTAR_HEADERS, follow_redirects=True) as client:
         results = await asyncio.gather(*(fetch_with_sem(r, d) for r, d in tasks))
 
     updated = {}
@@ -182,6 +229,9 @@ async def _do_check_prices(application=None) -> int:
             except (KeyError, ValueError):
                 continue
 
+            if departure < now:
+                continue
+
             key       = f"{from_name}|{departure.strftime('%Y%m%d%H%M')}"
             price_eur = j.get("price")
 
@@ -189,10 +239,6 @@ async def _do_check_prices(application=None) -> int:
                 continue
 
             updated[key] = {"price": price_eur, "departure": departure.isoformat()}
-
-            # Skip already-departed trains
-            if departure < now:
-                continue
 
             old_entry = old.get(key)
             old_price = old_entry.get("price") if old_entry else None
@@ -202,8 +248,6 @@ async def _do_check_prices(application=None) -> int:
                 and old_price is not None
                 and price_eur < old_price - 0.01
             )
-            # Only alert for new journeys that have a known price,
-            # or for any journey whose price dropped
             if price_dropped or (is_new and price_eur is not None):
                 alerts.append({
                     "from_name": from_name,
@@ -218,7 +262,6 @@ async def _do_check_prices(application=None) -> int:
     save_data(data)
 
     if alerts and application:
-        # Sort by price asc, cap at 30 per run to avoid flooding
         alerts.sort(key=lambda x: (x["price"] or 9999, x["departure"]))
         for a in alerts[:30]:
             dep       = a["departure"]
@@ -245,8 +288,8 @@ async def _do_check_prices(application=None) -> int:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "👋 Привет! Я слежу за ценами на поезда из Германии в Париж.\n\n"
-        "Маршруты:\n• Düsseldorf Hbf → Paris\n• Köln Hbf → Paris\n\n"
+        "👋 Привет! Я слежу за ценами на поезда Eurostar из Германии в Париж.\n\n"
+        "Маршруты:\n• Düsseldorf Hbf → Paris Nord\n• Köln Hbf → Paris Nord\n\n"
         "Проверяю цены каждый час на ближайшие 60 дней.\n"
         "Уведомления приходят только при появлении новых или подешевевших билетов.",
         reply_markup=KEYBOARD,
